@@ -165,9 +165,6 @@ function! s:update_breakpoint(res) abort
   let oldfile = fnamemodify(expand('%'), ':p:gs!\\!/!')
   if oldfile != filename
     silent! exe 'edit' filename
-    " synchronize breakpoints in case the new filename is not already loaded
-    " in a buffer.
-    call s:sync_breakpoints()
   endif
   silent! exe 'norm!' linenr.'G'
   silent! normal! zvzz
@@ -367,9 +364,6 @@ function! s:goto_file() abort
   let oldfile = fnamemodify(expand('%'), ':p:gs!\\!/!')
   if oldfile != filename
     silent! exe 'edit' filename
-    " synchronize breakpoints in case the new filename is not already loaded
-    " in a buffer.
-    call s:sync_breakpoints()
   endif
   silent! exe 'norm!' linenr.'G'
   silent! normal! zvzz
@@ -642,73 +636,13 @@ function! s:connect(addr) abort
   " stdout and stderr will be logged.
   let s:state['ready'] = 1
 
-  call s:sync_breakpoints()
+  " replace all the breakpoints set before delve started so that the ids won't overlap.
+  for l:bt in s:list_breakpointsigns()
+    call s:sign_unplace(l:bt.id, l:bt.file)
+    call go#debug#Breakpoint(l:bt.line, l:bt.file)
+  endfor
 
   call s:create_layout()
-endfunction
-
-function! s:sync_breakpoints()
-  try
-    " get the breakpoints
-    let l:promise = go#promise#New(function('s:rpc_response'), 20000, {})
-    call s:call_jsonrpc(l:promise.wrapper, 'RPCServer.ListBreakpoints', {'All': v:true})
-    let l:res = l:promise.await()
-    if type(l:res) != v:t_dict || !has_key(l:res, 'result') || type(l:res.result) != v:t_dict || !has_key(l:res.result, 'Breakpoints')
-      call go#util#EchoError('could not list breakpoints')
-    endif
-    let l:breakpoints = l:res.result.Breakpoints
-
-    let l:signs = s:list_breakpointsigns()
-
-    " the breakpoints with a sign
-    let l:signsByBreakpointID = {}
-    " the signs with a breakpoint
-    let l:breakpointsBySignID = {}
-
-
-    " replace the sign when the id of the breakpoint and the sign are
-    " different
-    for l:sign in l:signs
-      for l:breakpoint in l:breakpoints
-        if l:sign.file == s:substituteRemotePath(l:breakpoint.file) && l:sign.line == l:breakpoint.line
-          if l:sign.id != l:breakpoint.id
-            call s:sign_unplace(l:sign.id, l:sign.file)
-            call s:sign_place(l:breakpoint.id, s:substituteRemotePath(l:breakpoint.file), l:breakpoint.line)
-          endif
-
-          let l:signsByBreakpointID[l:breakpoint.id] = l:sign.id
-          let l:breakpointsBySignID[l:sign.id] = l:breakpoint.id
-          break
-        endif
-      endfor
-    endfor
-
-    " add a sign for each breakpoint without a sign
-    for l:breakpoint in l:breakpoints
-      if empty(get(l:signsByBreakpointID, l:breakpoint.id, ''))
-        " ignore breakpoints in files not yet associated with a buffer.
-        let l:localpath = s:substituteRemotePath(l:breakpoint.file)
-        let l:bufname = bufname(fnamemodify(l:localpath, ':.'))
-        if l:bufname is ''
-          continue
-        endif
-
-        call s:sign_place(l:breakpoint.id, l:localpath, l:breakpoint.line)
-      endif
-    endfor
-
-    " add a breakpoint for each sign without a breakpoint
-    for l:sign in l:signs
-      if empty(get(l:breakpointsBySignID, l:sign.id, ''))
-        let l:promise = go#promise#New(function('s:rpc_response'), 20000, {})
-        call s:call_jsonrpc(l:promise.wrapper, 'RPCServer.CreateBreakpoint', {'Breakpoint': {'file': s:substituteLocalPath(l:sign.file), 'line': l:sign.line}})
-        let l:res = l:promise.await()
-      endif
-    endfor
-  catch
-    call go#util#EchoError(printf('failed to sync breakpoints (%s): %s', v:throwpoint, v:exception))
-  finally
-  endtry
 endfunction
 
 " s:on_data's third optional argument is provided, but not used, so that the
@@ -1586,10 +1520,6 @@ function! s:list_breakpointsigns()
   for l:item in l:signs
     let l:file = fnamemodify(bufname(l:item.bufnr), ':p')
     for l:sign in l:item.signs
-      " ignore the current location sign
-      if l:sign.id is 9999
-        continue
-      endif
       call add(l:breakpoints, {
             \ 'id': l:sign.id,
             \ 'file': l:file,
